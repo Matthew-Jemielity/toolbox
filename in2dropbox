@@ -1,0 +1,296 @@
+#! /usr/bin/env sh
+
+panic () {
+	local readonly REASON="${1}"
+	cat << EOF >&2
++--------+
+| UH-OH! |
++--------+
+EOF
+	echo "${REASON}" >&2
+	exit 1
+}
+
+mibibytes_to_bytes () {
+	local readonly MIBIBYTES="${1}"
+	echo "$(( ${MIBIBYTES} * 1024 * 1024 ))"
+}
+
+# limit is really 150MB, but 1MB works well with slow networks
+readonly DROPBOX_CHUNK_LIMIT="$(mibibytes_to_bytes 1)"
+readonly DROPBOX_SESSION_SIZE_LIMIT_GB="350"
+readonly DROPBOX_SESSION_SIZE_LIMIT="$(mibibytes_to_bytes \
+	$(( ${DROPBOX_SESSION_SIZE_LIMIT_GB} * 1024 )))"
+
+usage () {
+	cat << EOF
+Usage: in2dropbox <OAUTH2 token> </path/to/file>
+
+in2dropbox allows upload of large files to dropbox.
+Requires valid OAUTH2 token. Requires curl.
+Maximum file size that can be sent is:
+  ${DROPBOX_SESSION_SIZE_LIMIT_GB} GB
+EOF
+}
+
+get_file_size () {
+	local readonly FILE="${1}"
+
+	if test "x${FILE}" = "x"
+	then
+		panic "file name is empty"
+	fi
+
+	stat -f "%z" "${FILE}"
+}
+
+get_total_iterations () {
+	local readonly TOTAL_SIZE="${1}"
+	local readonly CHUNK_SIZE="${2}"
+
+	if test "x${CHUNK_SIZE}" = "x0"
+	then
+		panic "wrong chunk size"
+	fi
+
+	echo "$(( $(( ${TOTAL_SIZE} + $(( ${CHUNK_SIZE} - 1 )) )) / ${CHUNK_SIZE} ))"
+}
+
+get_file_chunk () {
+	local readonly FILE="${1}"
+	local readonly CHUNK_SIZE="${2}"
+	local readonly CHUNK_NUMBER="${3}" # 0, 1, 2, ...
+
+	if test "x${FILE}" = "x"
+	then
+		panic "file name is empty"
+	fi
+
+	local readonly FILE_SIZE="$(get_file_size ${FILE})"
+	local readonly START_OFFSET="$(( ${CHUNK_NUMBER} * ${CHUNK_SIZE} ))"
+
+	if test ${START_OFFSET} -ge ${FILE_SIZE}
+	then
+		panic "start offset ${START_OFFSET} beyond file size ${FILE_SIZE}"
+	fi
+
+	local END_OFFSET="$(( ${START_OFFSET} + ${CHUNK_SIZE} ))"
+	if test ${END_OFFSET} -gt ${FILE_SIZE}
+	then
+		END_OFFSET="${FILE_SIZE}"
+	fi
+
+	local readonly CHUNK="$(mktemp)"
+
+	if test "x${CHUNK}" = "x"
+	then
+		panic "chunk file name is empty"
+	fi
+
+	dd if=${FILE} of=${CHUNK} bs=${CHUNK_SIZE} skip=${CHUNK_NUMBER} count=1 status=none
+	echo "${CHUNK}"
+}
+
+start_session () {
+	local readonly OAUTH2="${1}"
+
+	if test "x${OAUTH2}" = "x"
+	then
+		panic "empty oauth2"
+	fi
+
+	local readonly RESULT=$( \
+		curl -L --post301 --post302 --post303 --max-time 1000000 --retry 1000000 -X POST \
+		https://content.dropboxapi.com/2/files/upload_session/start \
+		--header "Authorization: Bearer ${OAUTH2}" \
+		--header "Dropbox-API-Arg: \
+			{ \
+				\"close\": false \
+			} \
+		" \
+		--header "Content-Type: application/octet-stream" \
+		--silent \
+	)
+
+	local readonly SESSION_ID="$(echo ${RESULT} | sed 's/^.*id\": \"\(.*\)\".*$/\1/')"
+	echo "${SESSION_ID}"
+}
+
+append_chunk () {
+	local readonly OAUTH2="${1}"
+	local readonly PART="${2}"
+	local readonly CHUNK="${3}"
+	local readonly CHUNK_SIZE="${4}"
+	local readonly SESSION_ID="${5}"
+
+	if test "x${OAUTH2}" = "x"
+	then
+		panic "empty oauth2"
+	fi
+
+	if test "x${CHUNK}" = "x"
+	then
+		panic "chunk file name is empty"
+	fi
+
+	if test "x${SESSION_ID}" = "x"
+	then
+		panic "empty session id while appending"
+	fi
+
+	local readonly ALREADY="$(( ${PART} * ${CHUNK_SIZE} ))"
+	local readonly RESULT=$( \
+		curl -L --post301 --post302 --post303 --max-time 1000000 --retry 1000000 -X POST \
+		https://content.dropboxapi.com/2/files/upload_session/append_v2 \
+		--header "Authorization: Bearer ${OAUTH2}" \
+		--header "Dropbox-API-Arg: \
+			{ \
+				\"cursor\": { \
+					\"session_id\": \"${SESSION_ID}\", \
+					\"offset\": ${ALREADY} \
+				} \
+			} \
+		" \
+		--header "Content-Type: application/octet-stream" \
+		--data-binary @${CHUNK} \
+		--silent \
+	)
+
+	local NEXT_PART="$(( ${PART} + 1 ))"
+	if test "x$(echo \"${RESULT}\" | grep error)" != "x"
+	then
+		if test "x$(echo \"${RESULT}\" | grep incorrect_offset)" != "x"
+		then
+			# return PART for which dropbox wants chunk
+			local readonly CORRECT_OFFSET=$( \
+				echo "${RESULT}" | \
+				sed 's/^.*correct_offset": \(.*\)}}/\1/' \
+			)
+			NEXT_PART="$(( ${CORRECT_OFFSET} / ${CHUNK_SIZE} ))"
+		else
+			panic "append failure: $REASON"
+		fi
+	fi
+
+	echo "${NEXT_PART}"
+}
+
+
+finish_session () {
+	local readonly OAUTH2="${1}"
+	local readonly SENT_BYTES="${2}"
+	local readonly SESSION_ID="${3}"
+	local readonly FILENAME="${4}"
+
+	if test "x${OAUTH2}" = "x"
+	then
+		panic "empty oauth2"
+	fi
+
+	if test "x${SESSION_ID}" = "x"
+	then
+		panic "empty session id while finishing session"
+	fi
+
+	local readonly RESULT=$( \
+		curl -L --post301 --post302 --post303 --max-time 1000000 --retry 1000000 -X POST \
+		https://content.dropboxapi.com/2/files/upload_session/finish \
+		--header "Authorization: Bearer ${OAUTH2}" \
+		--header "Dropbox-API-Arg: \
+			{ \
+				\"cursor\": { \
+					\"session_id\": \"${SESSION_ID}\", \
+					\"offset\": ${SENT_BYTES} \
+				}, \
+				\"commit\": { \
+					\"path\": \"/${FILENAME}\", \
+					\"mode\": \"add\", \
+					\"autorename\": true, \
+					\"mute\": false, \
+					\"strict_conflict\": false \
+				} \
+			} \
+		" \
+		--header "Content-Type: application/octet-stream" \
+		--silent \
+	)
+
+	if test "x$(echo ${RESULT} | grep error)" != "x"
+	then
+		panic "failed finishing session: ${RESULT}"
+	fi
+}
+
+main () {
+	local readonly OAUTH2="${1}"
+	local readonly FILE="${2}"
+
+	if test "x${OAUTH2}" = "x"
+	then
+		panic "empty oauth2"
+		exit 1
+	fi
+
+	if test "x${FILE}" = "x"
+	then
+		usage
+		exit 1
+	fi
+
+	if test "x$(command -v curl)" = "x"
+	then
+		panic "cannot find curl"
+	fi
+
+	if test ${DROPBOX_SESSION_SIZE_LIMIT} -lt $(get_file_size ${FILE})
+	then
+		panic "file size too large to send"
+	fi
+
+	local readonly ITERATIONS="$(get_total_iterations \
+		$(get_file_size ${FILE}) \
+		${DROPBOX_CHUNK_LIMIT} \
+	)"
+
+	local readonly SESSION_ID="$(start_session \
+		${OAUTH2} \
+	|| panic 'starting session failed')"
+
+	if test "x${SESSION_ID}" = "x"
+	then
+		panic "empty session id"
+	fi
+
+	# no seq on default openbsd
+	PART="0"
+	while test ${PART} -lt ${ITERATIONS}
+	do
+		echo -n "$(( ${PART} + 1 ))/${ITERATIONS}..."
+		local CHUNK="$(get_file_chunk ${FILE} ${DROPBOX_CHUNK_LIMIT} ${PART})"
+		PART="$( \
+			append_chunk \
+				${OAUTH2} \
+				${PART} \
+				${CHUNK} \
+				${DROPBOX_CHUNK_LIMIT} \
+				${SESSION_ID} \
+		)"
+		rm "${CHUNK}" || panic
+	done
+
+	finish_session \
+		"${OAUTH2}" \
+		"$(get_file_size ${FILE})" \
+		"${SESSION_ID}" \
+		"$(basename ${FILE})"
+	echo "done"
+}
+
+if test "x$#" != "x2"
+then
+	usage
+	exit 1
+fi
+
+main "${1}" "${2}"
+
