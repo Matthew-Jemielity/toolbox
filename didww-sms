@@ -1,0 +1,163 @@
+#! /usr/bin/env sh
+
+panic () {
+	local readonly REASON="${1}"
+	echo "${REASON}"
+	exit 1
+} >&2 # fn output goes to stderr (posixly correct)
+
+require () {
+	local readonly PROGRAM="${1}"
+	local RESULT=0
+
+	if test "x" = "x$(command -v ${PROGRAM})"
+	then
+		RESULT=1
+	fi
+
+	return ${RESULT}
+}
+
+parse_response () {
+	local readonly CODE="${1}"
+	local readonly DATAFILE="${2}"
+	local readonly DEBUG="${3}"
+
+	case "${CODE}" in
+		\"201\")
+			if test "x1" = "x${DEBUG}"
+			then
+				echo "success, received data:"
+				cat "${DATAFILE}"
+			fi
+			;;
+		\"401\")
+			echo "no authorization to send sms " \
+				"from this ip or with provided credentials"
+			;;
+		\"400\")
+			echo "invalid request data"
+			;;
+		*)
+			echo "unknown error"
+			;;
+	esac
+}
+
+sms () {
+	local readonly USERNAME="${1}"
+	local readonly PASSWORD="${2}"
+	local readonly SOURCE="${3}"
+	local readonly TARGET="${4}"
+	local readonly MESSAGE="${5}"
+	local readonly DEBUG="${6}"
+
+	test "x" != "x${USERNAME}" || panic "invalid auth: username or password"
+	test "x" != "x${PASSWORD}" || panic "invalid auth: username or password"
+	test "x" != "x${SOURCE}" || panic "no source number supplied"
+	test "x" != "x${TARGET}" || panic "no target number supplied"
+	test "x" != "x${MESSAGE}" || panic "empty sms not allowed"
+
+	local readonly NETRC="$(mktemp)"
+	local readonly JSON="$(mktemp -d)/json.txt"
+
+	echo \
+		"machine sms-out.didww.com login ${USERNAME} password ${PASSWORD}" \
+		> ${NETRC}
+
+	local readonly RESULT=$(
+		curl \
+			-L --post301 --post302 --post303 \
+			--max-time 1000000 --retry 1000000 \
+			--silent \
+			-X POST \
+			--netrc-file "${NETRC}" \
+			-H "Content-Type: application/vnd.api+json" \
+			-d "{ \
+				\"data\": { \
+					\"type\": \"outbound_messages\", \
+					\"attributes\": { \
+						\"destination\": \"${TARGET}\", \
+						\"source\": \"${SOURCE}\", \
+						\"content\": \"${MESSAGE}\" \
+					} \
+				} \
+			}" \
+			-o ${JSON} \
+			-w \"%{http_code}\" \
+			https://sms-out.didww.com/outbound_messages \
+	)
+
+	rm "${NETRC}"
+
+	parse_response "${RESULT}" "${JSON}" "${DEBUG}"
+
+	rm -r "$(dirname ${JSON})"
+}
+
+help () {
+	cat << EOF
+Usage: didww-sms <-t "E.164-conformant phone number"> <-m "SMS text">
+	Send SMS using DIDWW SMS out HTTP trunk.
+	Requires properly set up trunk.
+	Requires modifying script with proper authentication information:
+	- username and password obtained from DIDWW dashboard
+	- source phone number in E.164 format.
+	Options:
+		-t	Target phone number, E.164 format, e.g. 37041654321
+		-m	Text of message to send
+		-d	Enable debug: shows received response data
+		-h	Show this help
+EOF
+}
+
+# in case phone number doesn't exactly follow E.164
+normalize_phone_number () {
+	local readonly INPUT="${1}"
+	# remove +, -, (, ), etc., leaving only digits
+	echo "${INPUT}" | tr -dc '0-9'
+}
+
+main () {
+	local readonly USERNAME="**********" # didww sms out http trunk auth
+	local readonly PASSWORD="**********" # didww sms out http trunk auth
+	local readonly SOURCE="***********" # did authorized to send sms
+	local TARGET=""
+	local MESSAGE=""
+	local DEBUG=0
+
+	while getopts t:m:dh OPT
+	do
+		case "${OPT}" in
+			t) # target
+				TARGET="${OPTARG}"
+				;;
+			m) # message
+				MESSAGE="${OPTARG}"
+				;;
+			h) # help
+				help
+				exit 0
+				;;
+			d) # debug
+				DEBUG=1
+				;;
+			*)
+				help
+				exit 1
+				;;
+		esac
+	done
+
+	sms \
+		"${USERNAME}" \
+		"${PASSWORD}" \
+		"$(normalize_phone_number ${SOURCE})" \
+		"$(normalize_phone_number ${TARGET})" \
+		"${MESSAGE}" \
+		"${DEBUG}"
+}
+
+require curl || panic "curl is required for script to function"
+main "$@"
+
